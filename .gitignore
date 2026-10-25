@@ -1,0 +1,13 @@
+# Xray-core is downloaded at install time, not stored in the repo
+xray/
+
+# The generated config contains the client UUID
+config.json
+
+# Backups of ~/.claude/settings.json
+*.bak
+*.bak-*
+
+# Local shortcuts and logs
+*.lnk
+*.log
