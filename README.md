@@ -4,13 +4,13 @@
 что делать если сломалось. Личных данных здесь нет — IP, ссылка и пароли подставляются по ходу.
 
 ```
-Claude Code → 127.0.0.1:12345 (Xray на компьютере) → <SERVER_IP>:443 (VPS, VLESS+Reality) → интернет
+Claude Code / opencode → 127.0.0.1:12345 (Xray на компьютере) → <SERVER_IP>:443 (VPS, VLESS+Reality) → интернет
 ```
 
 - Прокси слушает **только 127.0.0.1** — в локальную сеть ничего не открыто.
 - Маршруты, системный прокси и фаервол Windows/macOS **не меняются**: офисный VPN
   (split tunneling) продолжает работать как обычно.
-- Через сервер ходит только то, что явно направлено: Claude Code и, при желании, браузер.
+- Через сервер ходит только то, что явно направлено: Claude Code, opencode и, при желании, браузер.
 
 ---
 
@@ -96,23 +96,23 @@ scp root@<SERVER_IP>:/root/x-ui-backup-*.tar.gz .
 Права администратора не нужны.
 
 ```powershell
-.\setup-windows.ps1 -Link "vless://...."
+.\setup-windows.ps1 -Link "vless://...." -Claude
 ```
 
 Если PowerShell блокирует скрипт:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\setup-windows.ps1 -Link "vless://...."
+powershell -ExecutionPolicy Bypass -File .\setup-windows.ps1 -Link "vless://...." -Claude
 ```
 
-Скрипт скачивает Xray-core, собирает конфиг, ставит автозапуск, прописывает прокси в
-`%USERPROFILE%\.claude\settings.json`, запускает и проверяет туннель.
+Скрипт скачивает Xray-core, собирает конфиг, ставит автозапуск, запускает и проверяет
+туннель. Приложения настраиваются флагами `-Claude` / `-OpenCode` (раздел 3).
 
 ### 2.3 macOS
 
 ```bash
 chmod +x setup-macos.sh
-./setup-macos.sh --link "vless://...."
+./setup-macos.sh --link "vless://...." --claude
 ```
 
 То же самое, но автозапуск через LaunchAgent (`~/Library/LaunchAgents/local.xray.plist`):
@@ -125,12 +125,18 @@ chmod +x setup-macos.sh
 | `-Link` / `--link` | ссылка; без неё скрипт спросит или оставит текущий конфиг |
 | `-Port` / `--port` | локальный порт, по умолчанию `12345` |
 | `-NoAutostart` / `--no-autostart` | не ставить автозапуск |
-| `-NoClaude` / `--no-claude` | не трогать настройки Claude Code |
+| `-Claude` / `--claude` | прописать прокси в `~/.claude/settings.json` |
+| `-OpenCode` / `--opencode` | прописать прокси в окружение фонового сервиса opencode |
 | `-Update` / `--update` | перекачать ядро (конфиг сохраняется) |
 | `-Uninstall` / `--uninstall` | удалить всё, что поставил скрипт |
 
-Скрипт правит `settings.json` аккуратно: добавляет три ключа в `env`, остальные настройки
-сохраняет, перед изменением делает копию `.bak`.
+Без этих флагов скрипт настраивает только Xray. `-Uninstall` чистит обе интеграции сам,
+но убирает лишь значения, совпадающие с локальным прокси. `settings.json` правится
+аккуратно: три ключа в `env`, остальные настройки на месте, перед изменением — копия `.bak`.
+
+Если флаг не передан, а у приложения уже стоят чужие (другой порт) настройки локального
+прокси, скрипт предупредит: `claude code still points at ... / opencode still points at ...`,
+и подсказать заново запустить с нужным флагом.
 
 ### 2.5 Проверка
 
@@ -148,7 +154,9 @@ curl -s -x http://127.0.0.1:12345 https://api.ipify.org
 
 ---
 
-## 3. Claude Code
+## 3. Claude Code и opencode
+
+### 3.1 Claude Code
 
 Установка (Windows, нужен Node.js 18+):
 
@@ -159,7 +167,8 @@ npm install -g @anthropic-ai/claude-code
 macOS: `curl -fsSL https://claude.ai/install.sh | bash` (если `claude.ai` недоступен —
 сначала `export HTTPS_PROXY=http://127.0.0.1:12345`).
 
-Прокси скрипт уже прописал в `~/.claude/settings.json` (`%USERPROFILE%\.claude\settings.json`):
+Прокси скрипт прописал в `~/.claude/settings.json` (`%USERPROFILE%\.claude\settings.json`),
+если запускался с `--claude` / `-Claude`:
 
 ```json
 { "env": { "HTTPS_PROXY": "http://127.0.0.1:12345",
@@ -173,6 +182,37 @@ macOS: `curl -fsSL https://claude.ai/install.sh | bash` (если `claude.ai` н
 **Браузер** нужен только для страницы логина. Firefox + FoxyProxy Standard: прокси HTTP
 `127.0.0.1:12345`, шаблоны `*claude.ai*` и `*anthropic.com*`, режим «by patterns». Через сервер
 ходят только эти домены, остальное — напрямую.
+
+### 3.2 opencode
+
+opencode — клиент-сервер: запросы делает фоновый сервис, и он читает `HTTP_PROXY` /
+`HTTPS_PROXY` из своего окружения, а не из `settings.json`. Поэтому скрипту нужен отдельный
+флаг:
+
+```powershell
+.\setup-windows.ps1 -Link "vless://...." -OpenCode
+```
+
+```bash
+./setup-macos.sh --link "vless://...." --opencode
+```
+
+То же самое руками:
+
+```bash
+opencode service set env HTTP_PROXY  http://127.0.0.1:12345
+opencode service set env HTTPS_PROXY http://127.0.0.1:12345
+opencode service set env NO_PROXY    localhost,127.0.0.1,::1
+opencode service start
+```
+
+`NO_PROXY` обязателен: CLI соединяется со своим сервисом по loopback, и прокси на `localhost`
+рвёт эту связь. Смена переменных перезапускает сервис — текущая сессия оборвётся, история
+сессий сохранится. Если opencode не установлен, скрипт предупредит и ничего не сломает.
+
+Проверка: `opencode service get env` показывает три переменные, обычный запрос в opencode
+проходит через сервер. Откат: `opencode service unset env HTTPS_PROXY` (и так же для
+`HTTP_PROXY`, `NO_PROXY`), затем `opencode service start`. `--uninstall` делает это сам.
 
 ---
 
@@ -196,7 +236,7 @@ launchctl bootout gui/$(id -u)/local.xray             # остановить
 |---|---|
 | сменился IP сервера, ключи, SNI, клиент | взять свежую ссылку и снова запустить скрипт с `-Link` |
 | нужна новая версия ядра | `-Update` / `--update` |
-| сменить локальный порт | `-Port` / `--port`, потом перезапустить `claude` |
+| сменить локальный порт | `-Port` / `--port`, повторить запуск с флагом интеграции, перезапустить приложения |
 | хочу видеть ошибки Xray | добавить в `config.json` `"log": { "loglevel": "warning", "error": "<путь>" }` |
 
 Проверка сервера одной строкой:
@@ -216,6 +256,7 @@ ssh root@<SERVER_IP> 'systemctl is-active x-ui; ss -ltnp | grep ":443"; ufw stat
 | `reality verification failed` | чужое ядро (Hiddify и подобные) | использовать Xray-core |
 | `connection reset` | сервер не отвечает на 443 | на сервере: `ss -ltnp \| grep ':443'` |
 | `claude` висит, curl работает | порт в `settings.json` ≠ порт Xray | сверить, перезапустить `claude` |
+| opencode не видит прокси | сервис запущен со старым окружением | `opencode service get env`, затем `opencode service start` |
 | панель отдаёт 404 | неверный base path / `http` вместо `https` | `https://127.0.0.1:<PORT>/<BASE_PATH>/` |
 | Xray не стартует: `empty "serverNames"` | пустой SNI | заполнить SNI = домен из Dest |
 | всё зелёное, но доступа нет | аккаунт/регион | см. раздел 6 |

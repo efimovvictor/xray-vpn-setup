@@ -1,21 +1,24 @@
 <#
 .SYNOPSIS
     Installs Xray-core as a local (loopback-only) proxy from a VLESS + Reality link
-    and points Claude Code at it.
+    and, on request, points Claude Code / opencode at it.
 
 .DESCRIPTION
     What the script does:
       1. Downloads the latest Xray-core release into %USERPROFILE%\xray.
       2. Builds config.json from the vless:// link (UUID, host, keys, SNI, flow - all taken from the link).
       3. Creates a hidden-start launcher and, unless -NoAutostart, a Startup shortcut.
-      4. Merges HTTPS_PROXY / HTTP_PROXY / NO_PROXY into %USERPROFILE%\.claude\settings.json
+      4. Starts the proxy and verifies it with a real HTTPS request.
+      5. With -Claude, merges HTTPS_PROXY / HTTP_PROXY / NO_PROXY into %USERPROFILE%\.claude\settings.json
          (existing keys are preserved; the file is never blindly overwritten).
-      5. Starts the proxy and verifies it with a real HTTPS request.
+      6. With -OpenCode, stores the same variables in the opencode background service environment,
+         which is what opencode reads (a running service does not inherit the shell environment).
 
     What it does NOT do:
       * no admin rights needed, no services, no drivers, no TUN
       * no route changes, no system proxy, no firewall rules
       * the proxy listens on 127.0.0.1 only, so a corporate/office VPN keeps working as usual
+      * no shell profile edits: proxy variables go only where the tool reads them
 
 .PARAMETER Link
     vless://UUID@HOST:PORT?type=tcp&security=reality&pbk=...&sni=...&sid=...&flow=...
@@ -30,18 +33,25 @@
 .PARAMETER NoAutostart
     Do not create the Startup shortcut.
 
-.PARAMETER NoClaude
-    Do not touch %USERPROFILE%\.claude\settings.json.
+.PARAMETER Claude
+    Write the proxy into %USERPROFILE%\.claude\settings.json.
+
+.PARAMETER OpenCode
+    Write the proxy into the opencode background service environment.
 
 .PARAMETER Update
     Re-download Xray-core even if it is already installed. config.json is kept.
 
 .PARAMETER Uninstall
     Stop the proxy, remove autostart, launcher and the install folder.
-    The proxy entries this script added to .claude\settings.json are removed too.
+    The proxy entries this script added are removed from both Claude Code and opencode
+    (only values that match the local proxy are touched).
 
 .EXAMPLE
     .\setup-windows.ps1 -Link "vless://...."
+
+.EXAMPLE
+    .\setup-windows.ps1 -Link "vless://...." -Claude -OpenCode
 
 .EXAMPLE
     .\setup-windows.ps1 -Port 10808
@@ -56,7 +66,8 @@ param(
     [int]$Port = 12345,
     [string]$InstallDir = '',
     [switch]$NoAutostart,
-    [switch]$NoClaude,
+    [switch]$Claude,
+    [switch]$OpenCode,
     [switch]$Update,
     [switch]$Uninstall
 )
@@ -74,12 +85,23 @@ $LauncherPath = Join-Path $InstallDir 'start-xray.vbs'
 $ClaudePath   = Join-Path $env:USERPROFILE '.claude\settings.json'
 $NoProxyList  = 'localhost,127.0.0.1,::1'
 $ProxyUrl     = 'http://127.0.0.1:' + $Port
+$OpenCodeResult = 'skipped'
 
 # ---------------------------------------------------------------- output helpers
 
 function Say  { param([string]$Text) Write-Host "==> $Text" -ForegroundColor Cyan }
 function Note { param([string]$Text) Write-Host "    $Text" }
 function Warn { param([string]$Text) Write-Host "    ! $Text" -ForegroundColor Yellow }
+
+# warn when an integration is left pointing at another local proxy (e.g. after a port change)
+function Show-StaleProxy {
+    param([string]$Url, [string]$Tool, [string]$Flag)
+    if (-not $Url) { return }
+    if ($Url -eq $ProxyUrl) { return }
+    if ($Url -notmatch '^http://(127\.0\.0\.1|localhost|\[::1\]):\d+$') { return }
+    Warn ("$Tool still points at $Url, the proxy is now at $ProxyUrl")
+    Warn ("re-run with $Flag to update it")
+}
 
 function Get-ShortcutPath {
     $dir = [Environment]::GetFolderPath('Startup')
@@ -380,6 +402,144 @@ function Remove-ClaudeProxy {
     }
 }
 
+function Get-ClaudeProxyUrl {
+    if (-not (Test-Path $ClaudePath)) { return '' }
+    try { $cfg = Read-JsonFile -Path $ClaudePath } catch { return '' }
+    if ($null -eq $cfg) { return '' }
+    if (-not $cfg.PSObject.Properties['env'] -or $null -eq $cfg.env) { return '' }
+    $prop = $cfg.env.PSObject.Properties['HTTPS_PROXY']
+    if ($prop -and $prop.Value) { return [string]$prop.Value }
+    $prop = $cfg.env.PSObject.Properties['HTTP_PROXY']
+    if ($prop -and $prop.Value) { return [string]$prop.Value }
+    return ''
+}
+
+# ---------------------------------------------------------------- opencode
+
+# Values live in the background service, so a running service has to be restarted.
+function Get-OpenCodeExe {
+    $oc = Get-Command opencode -ErrorAction SilentlyContinue
+    if (-not $oc) { return $null }
+    if ($oc.CommandType -eq 'Application' -and $oc.Path) { return $oc.Path }
+    if ($oc.Source) { return $oc.Source }
+    return $oc.Name
+}
+
+# current service environment as an object, or $null when it cannot be read
+function Get-OpenCodeEnv {
+    $exe = Get-OpenCodeExe
+    if (-not $exe) { return $null }
+    try {
+        $raw = & $exe service get env 2>$null
+    } catch {
+        return $null
+    }
+    if (-not $raw) { return $null }
+    try {
+        return (($raw | Out-String).Trim() | ConvertFrom-Json)
+    } catch {
+        return $null
+    }
+}
+
+function Get-OpenCodeProxyUrl {
+    $cfg = Get-OpenCodeEnv
+    if ($null -eq $cfg) { return '' }
+    $prop = $cfg.PSObject.Properties['HTTPS_PROXY']
+    if ($prop -and $prop.Value) { return [string]$prop.Value }
+    $prop = $cfg.PSObject.Properties['HTTP_PROXY']
+    if ($prop -and $prop.Value) { return [string]$prop.Value }
+    return ''
+}
+
+function Set-OpenCodeProxy {
+    param([string]$ProxyUrl)
+
+    $exe = Get-OpenCodeExe
+    if (-not $exe) {
+        $script:OpenCodeResult = 'missing'
+        Warn 'opencode is not installed - nothing to configure'
+        Warn ('  after installing it, run: opencode service set env HTTPS_PROXY ' + $ProxyUrl)
+        Warn ('  and: opencode service set env NO_PROXY ' + $NoProxyList)
+        return
+    }
+
+    $pairs = [ordered]@{
+        HTTP_PROXY  = $ProxyUrl
+        HTTPS_PROXY = $ProxyUrl
+        NO_PROXY    = $NoProxyList
+    }
+
+    $ok = $true
+    foreach ($name in $pairs.Keys) {
+        try {
+            & $exe service set env $name $pairs[$name] | Out-Null
+            if ($LASTEXITCODE -ne 0) { $ok = $false }
+        } catch {
+            $ok = $false
+        }
+    }
+
+    if (-not $ok) {
+        $script:OpenCodeResult = 'failed'
+        Warn 'could not update the opencode service environment'
+        Warn ('  run manually: opencode service set env HTTPS_PROXY ' + $ProxyUrl)
+        return
+    }
+    $script:OpenCodeResult = 'set'
+    Note 'opencode service env: HTTP_PROXY / HTTPS_PROXY / NO_PROXY'
+
+    try {
+        & $exe service start | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Note 'opencode service restarted with the new environment'
+        } else {
+            Warn 'start it manually: opencode service start'
+        }
+    } catch {
+        Warn 'start it manually: opencode service start'
+    }
+}
+
+function Remove-OpenCodeProxy {
+    param([string]$ProxyUrl)
+
+    $exe = Get-OpenCodeExe
+    if (-not $exe) { return }
+
+    $current = Get-OpenCodeEnv
+    if ($null -eq $current) {
+        Note 'opencode service env: left untouched (could not read the current values)'
+        return
+    }
+
+    $checks = [ordered]@{
+        HTTP_PROXY  = $ProxyUrl
+        HTTPS_PROXY = $ProxyUrl
+        NO_PROXY    = $NoProxyList
+    }
+
+    $removed = $false
+    foreach ($name in $checks.Keys) {
+        $prop = $current.PSObject.Properties[$name]
+        if (-not $prop) { continue }
+        if ($prop.Value -ne $checks[$name]) { continue }
+        try {
+            & $exe service unset env $name | Out-Null
+            if ($LASTEXITCODE -eq 0) { $removed = $true }
+        } catch {
+            Warn ('could not unset ' + $name + ' in the opencode service environment')
+        }
+    }
+
+    if ($removed) {
+        Note 'opencode service env: proxy entries removed'
+        try { & $exe service start | Out-Null } catch { Warn 'start it manually: opencode service start' }
+    } else {
+        Note 'opencode service env: nothing of ours to remove'
+    }
+}
+
 # ---------------------------------------------------------------- process
 
 function Restart-Xray {
@@ -452,7 +612,8 @@ if ($Uninstall) {
 
     Remove-Launcher -Launcher $LauncherPath
 
-    if (-not $NoClaude) { Remove-ClaudeProxy -Path $ClaudePath -ProxyUrl $ProxyUrl }
+    Remove-ClaudeProxy -Path $ClaudePath -ProxyUrl $ProxyUrl
+    Remove-OpenCodeProxy -ProxyUrl $ProxyUrl
 
     Remove-InstallDir -Dir $InstallDir
 
@@ -502,15 +663,25 @@ Test-XrayConfig -Path $ConfigPath
 Say 'Setting up autostart'
 Set-Launcher -Dir $InstallDir -Launcher $LauncherPath
 
-# 4. claude code
-if ($NoClaude) {
-    Say 'Claude Code settings: skipped (-NoClaude)'
-} else {
+# 4. claude code (opt-in)
+if ($Claude) {
     Say 'Configuring Claude Code'
     Set-ClaudeProxy -Path $ClaudePath -ProxyUrl $ProxyUrl
+} else {
+    Say 'Claude Code settings: skipped (pass -Claude to configure them)'
+    Show-StaleProxy -Url (Get-ClaudeProxyUrl) -Tool 'claude code' -Flag '-Claude'
 }
 
-# 5. start + verify
+# 5. opencode (opt-in)
+if ($OpenCode) {
+    Say 'Configuring opencode'
+    Set-OpenCodeProxy -ProxyUrl $ProxyUrl
+} else {
+    Say 'opencode settings: skipped (pass -OpenCode to configure them)'
+    Show-StaleProxy -Url (Get-OpenCodeProxyUrl) -Tool 'opencode' -Flag '-OpenCode'
+}
+
+# 6. start + verify
 Say 'Starting the proxy'
 Restart-Xray -Launcher $LauncherPath
 
@@ -520,11 +691,22 @@ Say 'Summary'
 Note "install dir : $InstallDir"
 Note "config      : $ConfigPath"
 Note "local proxy : $ProxyUrl  (HTTP and SOCKS5)"
-if ($NoClaude) {
+if ($Claude) {
+    Note "claude code : $ClaudePath"
+} else {
     Note 'claude code : untouched - add this to .claude\settings.json manually:'
     Note ('              "env": { "HTTPS_PROXY": "' + $ProxyUrl + '", "HTTP_PROXY": "' + $ProxyUrl + '", "NO_PROXY": "' + $NoProxyList + '" }')
+}
+if ($OpenCode) {
+    switch ($OpenCodeResult) {
+        'set'     { Note 'opencode    : background service env (HTTP_PROXY, HTTPS_PROXY, NO_PROXY)' }
+        'missing' { Note 'opencode    : not installed - nothing was changed' }
+        default   { Note 'opencode    : not configured - see the messages above' }
+    }
 } else {
-    Note "claude code : $ClaudePath"
+    Note 'opencode    : untouched - run these in a shell that does not use opencode yet:'
+    Note ('              opencode service set env HTTPS_PROXY ' + $ProxyUrl)
+    Note ('              opencode service set env NO_PROXY ' + $NoProxyList)
 }
 
 Write-Host ''

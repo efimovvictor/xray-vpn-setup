@@ -1,22 +1,26 @@
 #!/bin/bash
 # setup-macos.sh - install Xray-core as a local (loopback-only) proxy from a VLESS + Reality link
-#                 and point Claude Code at it.
+#                 and, on request, point Claude Code / opencode at it.
 #
 # What it does:
 #   1. Downloads the latest Xray-core release into ~/xray.
 #   2. Builds config.json from the vless:// link (UUID, host, keys, SNI, flow - all from the link).
 #   3. Installs a LaunchAgent so the proxy starts on login and restarts if it dies.
-#   4. Merges HTTPS_PROXY / HTTP_PROXY / NO_PROXY into ~/.claude/settings.json
+#   4. Starts the proxy and verifies it with a real HTTPS request.
+#   5. With --claude: merges HTTPS_PROXY / HTTP_PROXY / NO_PROXY into ~/.claude/settings.json
 #      (existing keys are preserved, the file is backed up before any change).
-#   5. Starts the proxy and verifies it with a real HTTPS request.
+#   6. With --opencode: stores the same variables in the opencode background service environment,
+#      which is what opencode reads (a running service does not inherit the shell environment).
 #
 # What it does NOT do:
 #   * no sudo, no system extensions, no TUN, no drivers
 #   * no route changes, no system proxy, no firewall rules
 #   * the proxy listens on 127.0.0.1 only, so a corporate VPN keeps working as usual
+#   * no shell profile edits: proxy variables go only where the tool reads them
 #
 # Usage:
 #   ./setup-macos.sh --link "vless://UUID@HOST:PORT?type=tcp&security=reality&pbk=...&sni=...&sid=...&flow=..."
+#   ./setup-macos.sh --link "vless://..." --claude --opencode
 #   ./setup-macos.sh --port 10808
 #   ./setup-macos.sh --update
 #   ./setup-macos.sh --uninstall
@@ -25,9 +29,11 @@
 #   --link URL        vless:// link. Omitted: an existing config is kept, otherwise you are prompted.
 #   --port N          local proxy port (HTTP + SOCKS5). Default: 12345
 #   --no-autostart    do not install the LaunchAgent
-#   --no-claude       do not touch ~/.claude/settings.json
+#   --claude          write the proxy into ~/.claude/settings.json
+#   --opencode        write the proxy into the opencode background service environment
 #   --update          re-download Xray-core (config.json is kept)
-#   --uninstall       stop the proxy, remove the LaunchAgent, the install dir and the proxy settings
+#   --uninstall       stop the proxy, remove the LaunchAgent, the install dir and the proxy
+#                     settings from both integrations (only values this script set are removed)
 #   -h, --help        this text
 
 set -eu
@@ -36,19 +42,22 @@ LABEL="local.xray"
 PORT=12345
 LINK=""
 AUTOSTART=1
-CLAUDE=1
+CLAUDE=0
+OPENCODE=0
 UPDATE=0
 UNINSTALL=0
 XRAY_DIR="${XRAY_DIR:-$HOME/xray}"
 NO_PROXY_LIST="localhost,127.0.0.1,::1"
 PY=""
+OPENCODE_BIN="$(command -v opencode 2>/dev/null || true)"
+OPENCODE_RESULT="skipped"
 
 say()  { printf '==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 warn() { printf '    ! %s\n' "$*" >&2; }
 die()  { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^set -eu/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -59,7 +68,8 @@ while [ $# -gt 0 ]; do
             [ $# -ge 2 ] || die "--port needs a value"
             PORT="$2"; shift 2 ;;
         --no-autostart) AUTOSTART=0; shift ;;
-        --no-claude)    CLAUDE=0; shift ;;
+        --claude)       CLAUDE=1; shift ;;
+        --opencode)     OPENCODE=1; shift ;;
         --update)       UPDATE=1; shift ;;
         --uninstall)    UNINSTALL=1; shift ;;
         -h|--help)      usage; exit 0 ;;
@@ -375,6 +385,105 @@ PYCODE
     note "$file: $result"
 }
 
+# prints the proxy URL currently stored for Claude Code (empty if none or unreadable)
+claude_proxy_url() {
+    [ -f "$CLAUDE_FILE" ] || return 0
+    _url=$(sed -n 's/.*"HTTPS_PROXY"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CLAUDE_FILE" | head -n 1)
+    if [ -z "$_url" ]; then
+        _url=$(sed -n 's/.*"HTTP_PROXY"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CLAUDE_FILE" | head -n 1)
+    fi
+    printf '%s' "$_url"
+}
+
+# warn when an integration is left pointing at another local proxy (e.g. after a port change)
+# args: URL, tool name, flag to re-run with
+warn_stale_proxy() {
+    [ -n "$1" ] || return 0
+    [ "$1" = "$PROXY" ] && return 0
+    case "$1" in
+        http://127.0.0.1:*|http://localhost:*|'http://[::1]:'*) ;;
+        *) return 0 ;;
+    esac
+    warn "$2 still points at $1, the proxy is now at $PROXY"
+    warn "re-run with $3 to update it"
+}
+
+# opencode: values live in the background service, so a running service has to be restarted.
+opencode_run() {
+    [ -n "$OPENCODE_BIN" ] || return 1
+    "$OPENCODE_BIN" "$@"
+}
+
+# param KEY -> value of KEY in 'opencode service get env' output (JSON), empty if absent.
+opencode_env_value() {
+    _raw=$(opencode_run service get env 2>/dev/null || true)
+    [ -n "$_raw" ] || return 0
+    printf '%s' "$_raw" | tr -d ' \t\n' |
+        sed -n 's/.*"'"$1"'":"\([^"]*\)".*/\1/p'
+}
+
+opencode_proxy_url() {
+    _url=$(opencode_env_value HTTPS_PROXY)
+    [ -n "$_url" ] || _url=$(opencode_env_value HTTP_PROXY)
+    printf '%s' "$_url"
+}
+
+set_opencode_proxy() {
+    proxy="$1"
+
+    if [ -z "$OPENCODE_BIN" ]; then
+        OPENCODE_RESULT="missing"
+        warn "opencode is not installed - nothing to configure"
+        warn "after installing it, run:"
+        warn "  opencode service set env HTTPS_PROXY $proxy"
+        warn "  opencode service set env NO_PROXY $NO_PROXY_LIST"
+        return 0
+    fi
+
+    ok=1
+    for key in HTTP_PROXY HTTPS_PROXY; do
+        opencode_run service set env "$key" "$proxy" >/dev/null 2>&1 || ok=0
+    done
+    opencode_run service set env NO_PROXY "$NO_PROXY_LIST" >/dev/null 2>&1 || ok=0
+
+    if [ "$ok" = "0" ]; then
+        OPENCODE_RESULT="failed"
+        warn "could not update the opencode service environment"
+        warn "run manually: opencode service set env HTTPS_PROXY $proxy"
+        return 0
+    fi
+    OPENCODE_RESULT="set"
+    note "opencode service env: HTTP_PROXY / HTTPS_PROXY / NO_PROXY"
+
+    if opencode_run service start >/dev/null 2>&1; then
+        note "opencode service restarted with the new environment"
+    else
+        warn "start it manually: opencode service start"
+    fi
+}
+
+remove_opencode_proxy() {
+    proxy="$1"
+
+    [ -n "$OPENCODE_BIN" ] || return 0
+
+    changed=0
+    for key in HTTP_PROXY HTTPS_PROXY; do
+        [ "$(opencode_env_value "$key")" = "$proxy" ] || continue
+        opencode_run service unset env "$key" >/dev/null 2>&1 && changed=1
+    done
+    if [ "$(opencode_env_value NO_PROXY)" = "$NO_PROXY_LIST" ]; then
+        opencode_run service unset env NO_PROXY >/dev/null 2>&1 && changed=1
+    fi
+
+    if [ "$changed" = "1" ]; then
+        note "opencode service env: proxy entries removed"
+        opencode_run service start >/dev/null 2>&1 || true
+    else
+        note "opencode service env: nothing of ours to remove"
+    fi
+}
+
 verify_tunnel() {
     i=0
     while [ $i -lt 8 ]; do
@@ -411,9 +520,8 @@ if [ "$UNINSTALL" = "1" ]; then
         note "removed $PLIST"
     fi
 
-    if [ "$CLAUDE" = "1" ]; then
-        remove_claude_proxy "$CLAUDE_FILE" "$PROXY"
-    fi
+    remove_claude_proxy "$CLAUDE_FILE" "$PROXY"
+    remove_opencode_proxy "$PROXY"
 
     if [ -d "$XRAY_DIR" ]; then
         i=0
@@ -472,15 +580,25 @@ else
     say "Autostart: skipped (--no-autostart)"
 fi
 
-# 4. claude code
+# 4. claude code (opt-in)
 if [ "$CLAUDE" = "1" ]; then
     say "Configuring Claude Code"
     set_claude_proxy "$CLAUDE_FILE" "$PROXY"
 else
-    say "Claude Code settings: skipped (--no-claude)"
+    say "Claude Code settings: skipped (pass --claude to configure them)"
+    warn_stale_proxy "$(claude_proxy_url)" "claude code" "--claude"
 fi
 
-# 5. start + verify
+# 5. opencode (opt-in)
+if [ "$OPENCODE" = "1" ]; then
+    say "Configuring opencode"
+    set_opencode_proxy "$PROXY"
+else
+    say "opencode settings: skipped (pass --opencode to configure them)"
+    warn_stale_proxy "$(opencode_proxy_url)" "opencode" "--opencode"
+fi
+
+# 6. start + verify
 say "Starting the proxy"
 if [ "$AUTOSTART" = "1" ]; then
     load_agent
@@ -502,6 +620,17 @@ if [ "$CLAUDE" = "1" ]; then
 else
     note "claude code : untouched - add this to $CLAUDE_FILE manually:"
     note "              \"env\": { \"HTTPS_PROXY\": \"$PROXY\", \"HTTP_PROXY\": \"$PROXY\", \"NO_PROXY\": \"$NO_PROXY_LIST\" }"
+fi
+if [ "$OPENCODE" = "1" ]; then
+    case "$OPENCODE_RESULT" in
+        set)     note "opencode    : background service env (HTTP_PROXY, HTTPS_PROXY, NO_PROXY)" ;;
+        missing) note "opencode    : not installed - nothing was changed" ;;
+        *)       note "opencode    : not configured - see the messages above" ;;
+    esac
+else
+    note "opencode    : untouched - run these in a shell that does not use opencode yet:"
+    note "              opencode service set env HTTPS_PROXY $PROXY"
+    note "              opencode service set env NO_PROXY $NO_PROXY_LIST"
 fi
 if [ "$AUTOSTART" = "1" ]; then
     note "autostart   : $PLIST (starts on login, restarts on crash)"
