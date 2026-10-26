@@ -550,7 +550,8 @@ function Remove-OpenCodeProxy {
 
 # ---------------------------------------------------------------- claude desktop
 
-# The Store install path contains the version, so the shortcut resolves the package on every launch.
+# The shortcut targets claude.exe directly, so the taskbar groups its window with the pinned app.
+# The Store install path contains the version: after an app update, re-run with -Desktop.
 function Get-DesktopShortcutPath {
     $dir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
     return (Join-Path $dir 'Claude (Xray proxy).lnk')
@@ -578,20 +579,17 @@ function Set-DesktopShortcut {
         return
     }
 
-    $inner = '$p = Get-AppxPackage | Where-Object { $_.PackageFamilyName -like ''Claude_*'' } | Select-Object -First 1; ' +
-             'Start-Process (Join-Path $p.InstallLocation ''app\claude.exe'') -ArgumentList ''--proxy-server=' + $ProxyUrl + ''''
-
     $shortcut = Get-DesktopShortcutPath
     $ws = New-Object -ComObject WScript.Shell
     $lnk = $ws.CreateShortcut($shortcut)
-    $lnk.TargetPath = 'powershell.exe'
-    $lnk.Arguments = '-NoProfile -WindowStyle Hidden -Command "' + $inner + '"'
+    $lnk.TargetPath = $exe
+    $lnk.Arguments = '--proxy-server=' + $ProxyUrl
+    $lnk.WorkingDirectory = Split-Path -Parent $exe
     $lnk.IconLocation = $exe + ',0'
-    $lnk.WindowStyle = 7
     $lnk.Save()
     $script:DesktopResult = 'set'
     Note "claude desktop shortcut: $shortcut"
-    Note 'start the app from this shortcut; close a running Claude window first'
+    Note 'start the app from this shortcut (unpin the old Claude icon, pin this one); close a running Claude window first'
 }
 
 function Remove-DesktopShortcut {
@@ -608,6 +606,22 @@ function Remove-DesktopShortcut {
         }
     } catch {
         Warn "could not remove ${shortcut}: $($_.Exception.Message)"
+    }
+}
+
+# the app was updated and the versioned path in the shortcut no longer exists
+function Show-StaleDesktopTarget {
+    $shortcut = Get-DesktopShortcutPath
+    if (-not (Test-Path $shortcut)) { return }
+    try {
+        $ws = New-Object -ComObject WScript.Shell
+        $target = $ws.CreateShortcut($shortcut).TargetPath
+    } catch {
+        return
+    }
+    if ($target -and -not (Test-Path $target)) {
+        Warn 'claude desktop shortcut points at an old app version'
+        Warn 're-run with -Desktop to update it'
     }
 }
 
@@ -773,6 +787,7 @@ if ($Desktop) {
 } else {
     Say 'Claude Desktop shortcut: skipped (pass -Desktop to create it)'
     Show-StaleProxy -Url (Get-DesktopProxyUrl) -Tool 'claude desktop shortcut' -Flag '-Desktop'
+    Show-StaleDesktopTarget
 }
 
 # 7. start + verify

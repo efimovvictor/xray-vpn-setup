@@ -272,12 +272,13 @@ opencode service start
 `--proxy-server=http://127.0.0.1:12345`: на Windows — ярлык «Claude (Xray proxy)» в меню Пуск
 (версия из Microsoft Store), на macOS — `~/Applications/Claude (Xray proxy).app`.
 
-Запускай приложение только из неё и перед этим полностью закрой уже открытое окно Claude
+Запускай приложение только из неё (старую иконку Claude на панели задач открепи, закрепи эту:
+иначе будут две) и перед этим полностью закрой уже открытое окно Claude
 (в том числе в трее): запущенный экземпляр флаг игнорирует. Вход в аккаунт идёт через браузер,
 которому тоже нужен прокси. Вручную: `claude.exe --proxy-server=http://127.0.0.1:12345`
 (Windows, `app\claude.exe` в `(Get-AppxPackage *Claude*).InstallLocation`) или
-`open -a Claude --args --proxy-server=http://127.0.0.1:12345` (macOS). Порт сменился —
-запусти скрипт ещё раз с `-Desktop`.
+`open -a Claude --args --proxy-server=http://127.0.0.1:12345` (macOS). Порт сменился
+или Claude обновился (путь в ярлыке содержит версию), — запусти скрипт ещё раз с `-Desktop`.
 
 ---
 
