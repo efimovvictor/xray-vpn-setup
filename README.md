@@ -278,7 +278,9 @@ opencode service start
 которому тоже нужен прокси. Вручную: `claude.exe --proxy-server=http://127.0.0.1:12345`
 (Windows, `app\claude.exe` в `(Get-AppxPackage *Claude*).InstallLocation`) или
 `open -a Claude --args --proxy-server=http://127.0.0.1:12345` (macOS). Порт сменился
-или Claude обновился (путь в ярлыке содержит версию), — запусти скрипт ещё раз с `-Desktop`.
+— запусти скрипт ещё раз с `-Desktop`. Путь в ярлыке содержит версию приложения, поэтому
+при входе в Windows маленький скрипт сам обновляет его (и закреплённую иконку) после апдейта Claude;
+с `-NoAutostart` этого нет, и после обновления нужно повторить `-Desktop`.
 
 ---
 
