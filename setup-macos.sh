@@ -35,6 +35,8 @@
 #   --opencode        write the proxy into the opencode background service environment
 #   --desktop         create a launcher app that starts Claude Desktop through the proxy
 #                     (start the app from it; an already running instance ignores the flag)
+#   --desktop-autostart  implies --desktop; also start Claude Desktop through the proxy on login
+#                     (turn off Claude's own "open at login", otherwise it starts without the proxy)
 #   --update          re-download Xray-core (config.json is kept)
 #   --uninstall       stop the proxy, remove the LaunchAgent, the install dir, the proxy
 #                     settings from both integrations (only values this script set are removed)
@@ -50,6 +52,7 @@ AUTOSTART=1
 CLAUDE=0
 OPENCODE=0
 DESKTOP=0
+DESKTOP_AUTOSTART=0
 UPDATE=0
 UNINSTALL=0
 XRAY_DIR="${XRAY_DIR:-$HOME/xray}"
@@ -78,6 +81,7 @@ while [ $# -gt 0 ]; do
         --claude)       CLAUDE=1; shift ;;
         --opencode)     OPENCODE=1; shift ;;
         --desktop)      DESKTOP=1; shift ;;
+        --desktop-autostart) DESKTOP=1; DESKTOP_AUTOSTART=1; shift ;;
         --update)       UPDATE=1; shift ;;
         --uninstall)    UNINSTALL=1; shift ;;
         -h|--help)      usage; exit 0 ;;
@@ -94,6 +98,8 @@ XRAY="$XRAY_DIR/xray"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 CLAUDE_FILE="$HOME/.claude/settings.json"
 DESKTOP_APP="$HOME/Applications/Claude (Xray proxy).app"
+DESKTOP_LABEL="local.xray.desktop"
+DESKTOP_PLIST="$HOME/Library/LaunchAgents/$DESKTOP_LABEL.plist"
 PROXY="http://127.0.0.1:$PORT"
 
 # ---------------------------------------------------------------- helpers
@@ -536,7 +542,41 @@ EOF
     note "start the app from this launcher; quit a running Claude first"
 }
 
+# LaunchAgent that opens the launcher at login, a few seconds after the proxy agent.
+set_desktop_autostart() {
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat > "$DESKTOP_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$DESKTOP_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>sleep 5; exec "$DESKTOP_APP/Contents/MacOS/launch"</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+EOF
+    launchctl bootout "gui/$(id -u)/$DESKTOP_LABEL" >/dev/null 2>&1 || true
+    note "claude desktop starts through the proxy at login: $DESKTOP_PLIST"
+}
+
+remove_desktop_autostart() {
+    launchctl bootout "gui/$(id -u)/$DESKTOP_LABEL" >/dev/null 2>&1 || true
+    if [ -f "$DESKTOP_PLIST" ]; then
+        rm -f "$DESKTOP_PLIST"
+        note "removed $DESKTOP_PLIST"
+    fi
+}
+
 remove_desktop_launcher() {
+    remove_desktop_autostart
     [ -d "$DESKTOP_APP" ] || return 0
     if grep -q -- '--proxy-server=' "$DESKTOP_APP/Contents/MacOS/launch" 2>/dev/null; then
         rm -rf "$DESKTOP_APP"
@@ -671,6 +711,16 @@ fi
 if [ "$DESKTOP" = "1" ]; then
     say "Configuring Claude Desktop"
     set_desktop_launcher "$PROXY"
+    if [ "$DESKTOP_AUTOSTART" = "1" ] && [ "$DESKTOP_RESULT" = "set" ]; then
+        if [ "$AUTOSTART" = "1" ]; then
+            set_desktop_autostart
+        else
+            warn "--desktop-autostart ignored: it needs the proxy autostart (drop --no-autostart)"
+            remove_desktop_autostart
+        fi
+    else
+        remove_desktop_autostart
+    fi
 else
     say "Claude Desktop launcher: skipped (pass --desktop to create it)"
     warn_stale_proxy "$(desktop_proxy_url)" "claude desktop launcher" "--desktop"

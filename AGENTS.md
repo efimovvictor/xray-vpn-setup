@@ -101,6 +101,7 @@ Xray настраивается, `settings.json` и opencode — только п
 | `-Claude` / `--claude` | прописать три переменные в `~/.claude/settings.json` |
 | `-OpenCode` / `--opencode` | прописать три переменные в окружение сервиса opencode |
 | `-Desktop` / `--desktop` | запускалка Claude Desktop с `--proxy-server` (Windows: ярлык в меню Пуск, macOS: `~/Applications/Claude (Xray proxy).app`) |
+| `-DesktopAutostart` / `--desktop-autostart` | подразумевает `-Desktop`; ещё и открывает приложение при входе, когда прокси отвечает (Windows: `-Launch` в `refresh-claude-shortcut.ps1`; macOS: LaunchAgent `local.xray.desktop`) |
 | `-Update` / `--update` | перекачать ядро, конфиг сохранить |
 | `-Uninstall` / `--uninstall` | остановить, убрать автозапуск, папку, свои ключи из интеграций и запускалку Claude Desktop |
 
@@ -128,7 +129,10 @@ Xray-core.
   `-Desktop` (без `-NoAutostart`) кладёт в `InstallDir` `refresh-claude-shortcut.ps1` и ярлык
   `XrayClaudeShortcut.lnk` в Startup: при входе скрипт переписывает путь в нашем ярлыке и в
   закреплённом на панели задач (`User Pinned\TaskBar`), только если в нём `--proxy-server=`.
-  Без автозапуска остаётся предупреждение о устаревшем ярлыке. Нет пакета — предупреждение, код 0.
+  Без автозапуска остаётся предупреждение о устаревшем ярлыке. `-DesktopAutostart` добавляет
+  в аргументы этого ярлыка `-Launch -ProxyUrl`: скрипт ждёт порт (до 30 с) и запускает приложение,
+  если оно ещё не открыто. Повторный `-Desktop` без флага снимает автозапуск. С `-NoAutostart`
+  флаг игнорируется с предупреждением. Нет пакета — предупреждение, код 0.
   На macOS обновления не мешают (`open -a`), там такого шага нет.
 - Удаление: только если запускалка содержит `--proxy-server=`; чужие файлы не трогать.
 
