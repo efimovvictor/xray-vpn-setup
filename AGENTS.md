@@ -100,10 +100,11 @@ Xray настраивается, `settings.json` и opencode — только п
 | `-NoAutostart` / `--no-autostart` | не ставить автозапуск |
 | `-Claude` / `--claude` | прописать три переменные в `~/.claude/settings.json` |
 | `-OpenCode` / `--opencode` | прописать три переменные в окружение сервиса opencode |
+| `-Desktop` / `--desktop` | запускалка Claude Desktop с `--proxy-server` (Windows: ярлык в меню Пуск, macOS: `~/Applications/Claude (Xray proxy).app`) |
 | `-Update` / `--update` | перекачать ядро, конфиг сохранить |
-| `-Uninstall` / `--uninstall` | остановить, убрать автозапуск, папку и свои ключи из обеих интеграций |
+| `-Uninstall` / `--uninstall` | остановить, убрать автозапуск, папку, свои ключи из интеграций и запускалку Claude Desktop |
 
-Без `-Claude` и `-OpenCode` скрипт не трогает ни `settings.json`, ни opencode:
+Без `-Claude`, `-OpenCode` и `-Desktop` скрипт не трогает ни `settings.json`, ни opencode, ни Claude Desktop:
 установка Xray — самостоятельная операция. `-Uninstall` флаги интеграций
 игнорирует и чистит обе, но удаляет только значения, равные локальному прокси.
 
@@ -116,6 +117,15 @@ HTTPS-запросом.
 `127.0.0.1:<PORT>` и один outbound `vless` с `reality` + `tcp` + `xtls-rprx-vision`.
 Параметры `spx` и `support-x25519mlkem768` из ссылки игнорируются — они не нужны
 Xray-core.
+
+### Интеграция Claude Desktop
+
+- Приложение не трогается: создаётся только отдельная запускалка с `--proxy-server=<url>`.
+  Системный прокси и файлы приложения не меняются.
+- Windows: пакет ищется через `Get-AppxPackage` по `PackageFamilyName -like 'Claude_*'`
+  **при каждом запуске ярлыка** (путь содержит версию), исполняемый файл — `app\claude.exe`.
+  Нет пакета — предупреждение, код 0.
+- Удаление: только если запускалка содержит `--proxy-server=`; чужие файлы не трогать.
 
 ### Интеграция opencode
 

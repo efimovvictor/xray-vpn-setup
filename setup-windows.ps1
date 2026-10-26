@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Installs Xray-core as a local (loopback-only) proxy from a VLESS + Reality link
-    and, on request, points Claude Code / opencode at it.
+    and, on request, points Claude Code / opencode / Claude Desktop at it.
 
 .DESCRIPTION
     What the script does:
@@ -13,6 +13,8 @@
          (existing keys are preserved; the file is never blindly overwritten).
       6. With -OpenCode, stores the same variables in the opencode background service environment,
          which is what opencode reads (a running service does not inherit the shell environment).
+      7. With -Desktop, creates a Start Menu shortcut that launches the Claude Desktop app
+         (Microsoft Store install) with --proxy-server pointing at the local proxy.
 
     What it does NOT do:
       * no admin rights needed, no services, no drivers, no TUN
@@ -39,19 +41,23 @@
 .PARAMETER OpenCode
     Write the proxy into the opencode background service environment.
 
+.PARAMETER Desktop
+    Create a Start Menu shortcut "Claude (Xray proxy)" that starts Claude Desktop through the proxy.
+    Start the app from that shortcut (an already running instance ignores the flag, close it first).
+
 .PARAMETER Update
     Re-download Xray-core even if it is already installed. config.json is kept.
 
 .PARAMETER Uninstall
     Stop the proxy, remove autostart, launcher and the install folder.
-    The proxy entries this script added are removed from both Claude Code and opencode
-    (only values that match the local proxy are touched).
+    The proxy entries this script added are removed from Claude Code and opencode
+    (only values that match the local proxy are touched), and the Claude Desktop shortcut is deleted.
 
 .EXAMPLE
     .\setup-windows.ps1 -Link "vless://...."
 
 .EXAMPLE
-    .\setup-windows.ps1 -Link "vless://...." -Claude -OpenCode
+    .\setup-windows.ps1 -Link "vless://...." -Claude -OpenCode -Desktop
 
 .EXAMPLE
     .\setup-windows.ps1 -Port 10808
@@ -68,6 +74,7 @@ param(
     [switch]$NoAutostart,
     [switch]$Claude,
     [switch]$OpenCode,
+    [switch]$Desktop,
     [switch]$Update,
     [switch]$Uninstall
 )
@@ -86,6 +93,7 @@ $ClaudePath   = Join-Path $env:USERPROFILE '.claude\settings.json'
 $NoProxyList  = 'localhost,127.0.0.1,::1'
 $ProxyUrl     = 'http://127.0.0.1:' + $Port
 $OpenCodeResult = 'skipped'
+$DesktopResult  = 'skipped'
 
 # ---------------------------------------------------------------- output helpers
 
@@ -540,6 +548,82 @@ function Remove-OpenCodeProxy {
     }
 }
 
+# ---------------------------------------------------------------- claude desktop
+
+# The Store install path contains the version, so the shortcut resolves the package on every launch.
+function Get-DesktopShortcutPath {
+    $dir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+    return (Join-Path $dir 'Claude (Xray proxy).lnk')
+}
+
+function Get-ClaudeDesktopExe {
+    try {
+        $pkg = Get-AppxPackage | Where-Object { $_.PackageFamilyName -like 'Claude_*' } | Select-Object -First 1
+    } catch {
+        return $null
+    }
+    if (-not $pkg) { return $null }
+    $exe = Join-Path $pkg.InstallLocation 'app\claude.exe'
+    if (Test-Path $exe) { return $exe }
+    return $null
+}
+
+function Set-DesktopShortcut {
+    param([string]$ProxyUrl)
+
+    $exe = Get-ClaudeDesktopExe
+    if (-not $exe) {
+        $script:DesktopResult = 'missing'
+        Warn 'Claude Desktop (Microsoft Store version) is not installed - no shortcut created'
+        return
+    }
+
+    $inner = '$p = Get-AppxPackage | Where-Object { $_.PackageFamilyName -like ''Claude_*'' } | Select-Object -First 1; ' +
+             'Start-Process (Join-Path $p.InstallLocation ''app\claude.exe'') -ArgumentList ''--proxy-server=' + $ProxyUrl + ''''
+
+    $shortcut = Get-DesktopShortcutPath
+    $ws = New-Object -ComObject WScript.Shell
+    $lnk = $ws.CreateShortcut($shortcut)
+    $lnk.TargetPath = 'powershell.exe'
+    $lnk.Arguments = '-NoProfile -WindowStyle Hidden -Command "' + $inner + '"'
+    $lnk.IconLocation = $exe + ',0'
+    $lnk.WindowStyle = 7
+    $lnk.Save()
+    $script:DesktopResult = 'set'
+    Note "claude desktop shortcut: $shortcut"
+    Note 'start the app from this shortcut; close a running Claude window first'
+}
+
+function Remove-DesktopShortcut {
+    $shortcut = Get-DesktopShortcutPath
+    if (-not (Test-Path $shortcut)) { return }
+    try {
+        $ws = New-Object -ComObject WScript.Shell
+        $lnk = $ws.CreateShortcut($shortcut)
+        if ($lnk.Arguments -like '*--proxy-server=*') {
+            Remove-Item $shortcut -Force
+            Note "removed $shortcut"
+        } else {
+            Warn "left $shortcut alone (it was not created by this script)"
+        }
+    } catch {
+        Warn "could not remove ${shortcut}: $($_.Exception.Message)"
+    }
+}
+
+function Get-DesktopProxyUrl {
+    $shortcut = Get-DesktopShortcutPath
+    if (-not (Test-Path $shortcut)) { return '' }
+    try {
+        $ws = New-Object -ComObject WScript.Shell
+        $args1 = $ws.CreateShortcut($shortcut).Arguments
+    } catch {
+        return ''
+    }
+    if ($args1 -match '--proxy-server=(http://[^'' "]+)') { return $Matches[1] }
+    return ''
+}
+
 # ---------------------------------------------------------------- process
 
 function Restart-Xray {
@@ -614,6 +698,7 @@ if ($Uninstall) {
 
     Remove-ClaudeProxy -Path $ClaudePath -ProxyUrl $ProxyUrl
     Remove-OpenCodeProxy -ProxyUrl $ProxyUrl
+    Remove-DesktopShortcut
 
     Remove-InstallDir -Dir $InstallDir
 
@@ -681,7 +766,16 @@ if ($OpenCode) {
     Show-StaleProxy -Url (Get-OpenCodeProxyUrl) -Tool 'opencode' -Flag '-OpenCode'
 }
 
-# 6. start + verify
+# 6. claude desktop (opt-in)
+if ($Desktop) {
+    Say 'Configuring Claude Desktop'
+    Set-DesktopShortcut -ProxyUrl $ProxyUrl
+} else {
+    Say 'Claude Desktop shortcut: skipped (pass -Desktop to create it)'
+    Show-StaleProxy -Url (Get-DesktopProxyUrl) -Tool 'claude desktop shortcut' -Flag '-Desktop'
+}
+
+# 7. start + verify
 Say 'Starting the proxy'
 Restart-Xray -Launcher $LauncherPath
 
@@ -707,6 +801,15 @@ if ($OpenCode) {
     Note 'opencode    : untouched - run these in a shell that does not use opencode yet:'
     Note ('              opencode service set env HTTPS_PROXY ' + $ProxyUrl)
     Note ('              opencode service set env NO_PROXY ' + $NoProxyList)
+}
+
+if ($Desktop) {
+    switch ($DesktopResult) {
+        'set'     { Note 'claude desktop: Start Menu shortcut "Claude (Xray proxy)"' }
+        'missing' { Note 'claude desktop: not installed - nothing was changed' }
+    }
+} else {
+    Note ('claude desktop: untouched - launch the app with: claude.exe --proxy-server=' + $ProxyUrl)
 }
 
 Write-Host ''

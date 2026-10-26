@@ -127,15 +127,16 @@ chmod +x setup-macos.sh
 | `-NoAutostart` / `--no-autostart` | не ставить автозапуск |
 | `-Claude` / `--claude` | прописать прокси в `~/.claude/settings.json` |
 | `-OpenCode` / `--opencode` | прописать прокси в окружение фонового сервиса opencode |
+| `-Desktop` / `--desktop` | создать ярлык, который запускает приложение Claude Desktop через прокси |
 | `-Update` / `--update` | перекачать ядро (конфиг сохраняется) |
 | `-Uninstall` / `--uninstall` | удалить всё, что поставил скрипт |
 
-Без этих флагов скрипт настраивает только Xray. `-Uninstall` чистит обе интеграции сам,
+Без этих флагов скрипт настраивает только Xray. `-Uninstall` чистит все интеграции сам,
 но убирает лишь значения, совпадающие с локальным прокси. `settings.json` правится
 аккуратно: три ключа в `env`, остальные настройки на месте, перед изменением — копия `.bak`.
 
 Если флаг не передан, а у приложения уже стоят чужие (другой порт) настройки локального
-прокси, скрипт предупредит: `claude code still points at ... / opencode still points at ...`,
+прокси, скрипт предупредит: `claude code still points at ... / opencode still points at ... / claude desktop shortcut still points at ...`,
 и подсказать заново запустить с нужным флагом.
 
 ### 2.5 Проверка
@@ -204,7 +205,7 @@ Claude Code на телефоне не запускается, подходит 
 
 ---
 
-## 3. Claude Code и opencode
+## 3. Claude Code, opencode и Claude Desktop
 
 ### 3.1 Claude Code
 
@@ -263,6 +264,20 @@ opencode service start
 Проверка: `opencode service get env` показывает три переменные, обычный запрос в opencode
 проходит через сервер. Откат: `opencode service unset env HTTPS_PROXY` (и так же для
 `HTTP_PROXY`, `NO_PROXY`), затем `opencode service start`. `--uninstall` делает это сам.
+
+### 3.3 Claude Desktop
+
+Десктопное приложение не читает `settings.json` и без прокси пишет «unavailable in your region».
+Флаг `-Desktop` / `--desktop` создаёт запускалку, которая стартует приложение с
+`--proxy-server=http://127.0.0.1:12345`: на Windows — ярлык «Claude (Xray proxy)» в меню Пуск
+(версия из Microsoft Store), на macOS — `~/Applications/Claude (Xray proxy).app`.
+
+Запускай приложение только из неё и перед этим полностью закрой уже открытое окно Claude
+(в том числе в трее): запущенный экземпляр флаг игнорирует. Вход в аккаунт идёт через браузер,
+которому тоже нужен прокси. Вручную: `claude.exe --proxy-server=http://127.0.0.1:12345`
+(Windows, `app\claude.exe` в `(Get-AppxPackage *Claude*).InstallLocation`) или
+`open -a Claude --args --proxy-server=http://127.0.0.1:12345` (macOS). Порт сменился —
+запусти скрипт ещё раз с `-Desktop`.
 
 ---
 

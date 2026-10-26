@@ -1,6 +1,6 @@
 #!/bin/bash
 # setup-macos.sh - install Xray-core as a local (loopback-only) proxy from a VLESS + Reality link
-#                 and, on request, point Claude Code / opencode at it.
+#                 and, on request, point Claude Code / opencode / Claude Desktop at it.
 #
 # What it does:
 #   1. Downloads the latest Xray-core release into ~/xray.
@@ -11,6 +11,8 @@
 #      (existing keys are preserved, the file is backed up before any change).
 #   6. With --opencode: stores the same variables in the opencode background service environment,
 #      which is what opencode reads (a running service does not inherit the shell environment).
+#   7. With --desktop: creates ~/Applications/Claude (Xray proxy).app, a tiny launcher that starts
+#      the Claude Desktop app with --proxy-server pointing at the local proxy.
 #
 # What it does NOT do:
 #   * no sudo, no system extensions, no TUN, no drivers
@@ -20,7 +22,7 @@
 #
 # Usage:
 #   ./setup-macos.sh --link "vless://UUID@HOST:PORT?type=tcp&security=reality&pbk=...&sni=...&sid=...&flow=..."
-#   ./setup-macos.sh --link "vless://..." --claude --opencode
+#   ./setup-macos.sh --link "vless://..." --claude --opencode --desktop
 #   ./setup-macos.sh --port 10808
 #   ./setup-macos.sh --update
 #   ./setup-macos.sh --uninstall
@@ -31,9 +33,12 @@
 #   --no-autostart    do not install the LaunchAgent
 #   --claude          write the proxy into ~/.claude/settings.json
 #   --opencode        write the proxy into the opencode background service environment
+#   --desktop         create a launcher app that starts Claude Desktop through the proxy
+#                     (start the app from it; an already running instance ignores the flag)
 #   --update          re-download Xray-core (config.json is kept)
-#   --uninstall       stop the proxy, remove the LaunchAgent, the install dir and the proxy
+#   --uninstall       stop the proxy, remove the LaunchAgent, the install dir, the proxy
 #                     settings from both integrations (only values this script set are removed)
+#                     and the Claude Desktop launcher
 #   -h, --help        this text
 
 set -eu
@@ -44,6 +49,7 @@ LINK=""
 AUTOSTART=1
 CLAUDE=0
 OPENCODE=0
+DESKTOP=0
 UPDATE=0
 UNINSTALL=0
 XRAY_DIR="${XRAY_DIR:-$HOME/xray}"
@@ -51,6 +57,7 @@ NO_PROXY_LIST="localhost,127.0.0.1,::1"
 PY=""
 OPENCODE_BIN="$(command -v opencode 2>/dev/null || true)"
 OPENCODE_RESULT="skipped"
+DESKTOP_RESULT="skipped"
 
 say()  { printf '==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
@@ -70,6 +77,7 @@ while [ $# -gt 0 ]; do
         --no-autostart) AUTOSTART=0; shift ;;
         --claude)       CLAUDE=1; shift ;;
         --opencode)     OPENCODE=1; shift ;;
+        --desktop)      DESKTOP=1; shift ;;
         --update)       UPDATE=1; shift ;;
         --uninstall)    UNINSTALL=1; shift ;;
         -h|--help)      usage; exit 0 ;;
@@ -85,6 +93,7 @@ CONFIG="$XRAY_DIR/config.json"
 XRAY="$XRAY_DIR/xray"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 CLAUDE_FILE="$HOME/.claude/settings.json"
+DESKTOP_APP="$HOME/Applications/Claude (Xray proxy).app"
 PROXY="http://127.0.0.1:$PORT"
 
 # ---------------------------------------------------------------- helpers
@@ -484,6 +493,65 @@ remove_opencode_proxy() {
     fi
 }
 
+# Claude Desktop: a minimal .app bundle whose only job is to start Claude with --proxy-server.
+set_desktop_launcher() {
+    proxy="$1"
+
+    target=""
+    for _c in "/Applications/Claude.app" "$HOME/Applications/Claude.app"; do
+        if [ -d "$_c" ]; then target="$_c"; break; fi
+    done
+    if [ -z "$target" ]; then
+        DESKTOP_RESULT="missing"
+        warn "Claude Desktop is not installed - no launcher created"
+        return 0
+    fi
+
+    mkdir -p "$DESKTOP_APP/Contents/MacOS"
+    cat > "$DESKTOP_APP/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Claude (Xray proxy)</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.xray.claude-desktop</string>
+    <key>CFBundleExecutable</key>
+    <string>launch</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>
+EOF
+    cat > "$DESKTOP_APP/Contents/MacOS/launch" <<EOF
+#!/bin/sh
+exec /usr/bin/open -a "$target" --args --proxy-server=$proxy
+EOF
+    chmod +x "$DESKTOP_APP/Contents/MacOS/launch"
+    DESKTOP_RESULT="set"
+    note "claude desktop launcher: $DESKTOP_APP"
+    note "start the app from this launcher; quit a running Claude first"
+}
+
+remove_desktop_launcher() {
+    [ -d "$DESKTOP_APP" ] || return 0
+    if grep -q -- '--proxy-server=' "$DESKTOP_APP/Contents/MacOS/launch" 2>/dev/null; then
+        rm -rf "$DESKTOP_APP"
+        note "removed $DESKTOP_APP"
+    else
+        warn "left $DESKTOP_APP alone (it was not created by this script)"
+    fi
+}
+
+# prints the proxy URL stored in the Claude Desktop launcher (empty if none)
+desktop_proxy_url() {
+    [ -f "$DESKTOP_APP/Contents/MacOS/launch" ] || return 0
+    sed -n 's/.*--proxy-server=\(http:[^ ]*\).*/\1/p' "$DESKTOP_APP/Contents/MacOS/launch" | head -n 1
+}
+
 verify_tunnel() {
     i=0
     while [ $i -lt 8 ]; do
@@ -522,6 +590,7 @@ if [ "$UNINSTALL" = "1" ]; then
 
     remove_claude_proxy "$CLAUDE_FILE" "$PROXY"
     remove_opencode_proxy "$PROXY"
+    remove_desktop_launcher
 
     if [ -d "$XRAY_DIR" ]; then
         i=0
@@ -598,7 +667,16 @@ else
     warn_stale_proxy "$(opencode_proxy_url)" "opencode" "--opencode"
 fi
 
-# 6. start + verify
+# 6. claude desktop (opt-in)
+if [ "$DESKTOP" = "1" ]; then
+    say "Configuring Claude Desktop"
+    set_desktop_launcher "$PROXY"
+else
+    say "Claude Desktop launcher: skipped (pass --desktop to create it)"
+    warn_stale_proxy "$(desktop_proxy_url)" "claude desktop launcher" "--desktop"
+fi
+
+# 7. start + verify
 say "Starting the proxy"
 if [ "$AUTOSTART" = "1" ]; then
     load_agent
@@ -631,6 +709,14 @@ else
     note "opencode    : untouched - run these in a shell that does not use opencode yet:"
     note "              opencode service set env HTTPS_PROXY $PROXY"
     note "              opencode service set env NO_PROXY $NO_PROXY_LIST"
+fi
+if [ "$DESKTOP" = "1" ]; then
+    case "$DESKTOP_RESULT" in
+        set)     note "claude desktop: launcher $DESKTOP_APP" ;;
+        missing) note "claude desktop: not installed - nothing was changed" ;;
+    esac
+else
+    note "claude desktop: untouched - launch the app with: open -a Claude --args --proxy-server=$PROXY"
 fi
 if [ "$AUTOSTART" = "1" ]; then
     note "autostart   : $PLIST (starts on login, restarts on crash)"
