@@ -11,3 +11,8 @@ config.json
 # Local shortcuts and logs
 *.lnk
 *.log
+
+# WireGuard: приватные ключи и QR никогда не коммитим
+wireguard/out/
+*.conf
+*.png

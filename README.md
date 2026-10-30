@@ -351,3 +351,113 @@ ssh root@<SERVER_IP> 'systemctl is-active x-ui; ss -ltnp | grep ":443"; ufw stat
 - **Регион.** Доступ из неподдерживаемой страны нарушает Usage Policy Anthropic. Прокси снижает
   риск блокировки, но не делает использование «правильным»: надёжный путь — аккаунт и оплата
   в поддерживаемой стране либо Claude через AWS Bedrock / Google Vertex.
+
+---
+
+## 7. WireGuard-хаб: телефон ↔ ПК через VPS
+
+Зачем: Android разрешает только один VPN, поэтому «Claude на телефоне» (v2rayNG) и «ADB с ПК на телефон» одновременно невозможны. WG-хаб решает это: телефон сидит в full tunnel до VPS (Claude видит IP VPS), а ПК — пир в той же сети, поэтому `adb install` и RDP работают всегда, без переключений.
+
+```
+телефон 10.66.66.2 ─┐
+                    ├── VPS 10.66.66.1 (UDP 51821, MASQUERADE)
+ПК      10.66.66.3 ─┘
+```
+
+Что даёт: Claude (IP VPS), `adb connect 10.66.66.2:5555`, `mstsc 10.66.66.3`. При этом на ПК WG подключён **только для подсети** — default route, интернет и офисный VPN не меняются.
+
+### 7.1 Генерация конфигов
+
+Нужны `wg.exe` (WireGuard for Windows) и `qrcode` (`pip install qrcode pillow`).
+
+```powershell
+python wireguard/gen-configs.py --vps <SERVER_IP> --port 51821 --out wireguard/out
+```
+
+Появятся:
+
+| Файл | Куда |
+|---|---|
+| `wg0.conf` | VPS, `/etc/wireguard/wg0.conf` |
+| `wg-pc.conf` | ПК, WireGuard (split, только `10.66.66.0/24`) |
+| `wg-phone.conf` | телефон, WireGuard (full tunnel) |
+| `wg-phone-qr.png` | то же в виде QR |
+
+Скрипт **отказывается перезаписывать** существующие конфиги: новые ключи сломают уже подключённые пиры. Перегенерация — только с `--force` и с повторным импортом на устройствах.
+
+### 7.2 Сервер
+
+```powershell
+scp wireguard\setup-wg-server.sh wireguard\out\wg0.conf root@<SERVER_IP>:/root/
+ssh root@<SERVER_IP> "bash /root/setup-wg-server.sh /root/wg0.conf"
+```
+
+Скрипт ставит WireGuard, включает `net.ipv4.ip_forward=1`, кладёт конфиг в `/etc/wireguard/wg0.conf`, открывает UDP-порт в ufw (если активен), включает `wg-quick@wg0`.
+
+Проверка на сервере:
+
+```bash
+wg show
+ip -4 addr show wg0 | grep inet
+```
+
+Важно: правила `PostUp` из конфига разрешают трафик **между пирами** (`-i wg0 -o wg0`) — без них телефон не увидит ПК для RDP.
+
+Если у провайдера VPS есть внешний файрвол (панель хостинга) — там тоже нужно открыть **UDP 51821**.
+
+### 7.3 ПК
+
+Импорт: WireGuard → «Add tunnel» → из файла `wg-pc.conf`. Либо службой:
+
+```powershell
+& "C:\Program Files\WireGuard\wireguard.exe" /installtunnelservice "E:\DEV\vpn-wg\wg-pc.conf"
+```
+
+RDP по WG: адаптер обычно получает профиль сети **Public**, а правила RDP разрешены только для Private/Domain. Лечится двумя командами от администратора:
+
+```powershell
+Set-NetConnectionProfile -InterfaceAlias "wg-pc" -NetworkCategory Private
+New-NetFirewallRule -DisplayName "RDP over WireGuard" -Direction Inbound -Protocol TCP -LocalPort 3389 -InterfaceAlias "wg-pc" -Action Allow -Profile Any
+```
+
+Проверка: `ping 10.66.66.1`, затем с телефона `mstsc 10.66.66.3`.
+
+### 7.4 Телефон
+
+1. Установить WireGuard из Play Store.
+2. «+» → сканировать QR (`wg-phone-qr.png`) либо импортировать `wg-phone.conf`.
+3. **Выключить v2rayNG** — активным может быть только один VPN.
+4. Включить туннель. Проверка: IP на <https://api.ipify.org> должен быть адресом VPS.
+5. Включить «Always-on VPN» для WireGuard, иначе после перезагрузки туннель не поднимется сам.
+
+### 7.5 Проверки
+
+| Где | Команда | Ожидаемо |
+|---|---|---|
+| ПК | `ping 10.66.66.1` | ответ |
+| ПК | `adb connect 10.66.66.2:5555` | `connected to ...` |
+| ПК | `adb devices` | `10.66.66.2:5555  device` |
+| телефон | `mstsc 10.66.66.3` | вход в Windows (учётка + пароль MSA, не PIN) |
+| телефон | <https://api.ipify.org> | IP VPS |
+
+### 7.6 Безопасность
+
+- Приватные ключи лежат только в `wireguard/out/` (в `.gitignore`); QR не публиковать и не пересылать в мессенджерах.
+- Наружу открыт один UDP-порт (по умолчанию 51821). Порт лучше держать нестандартным.
+- Телефон в full tunnel гонит **весь** трафик через VPS: расход трафика и батареи выше, чем у Xray с per-app прокси.
+- WG не умеет per-app: если нужен только Claude — остаётся Xray+Reality.
+- Tailscale остаётся резервом (прямое P2P, не зависит от VPS), но на телефоне одновременно с WG не работает.
+
+### 7.7 Ограничения и откат
+
+- Если провайдер начнёт резать UDP/WG — вернуться на Xray+v2rayNG (профиль телефона просто переключить обратно).
+- После перезагрузки телефона беспроводная отладка выключается; порт `5555` (режим `adb tcpip`) живёт до ребута — потом ADB снова надо включить вручную.
+- Полный откат: выключить туннели на ПК и телефоне, на VPS — `systemctl disable --now wg-quick@wg0`.
+
+| Симптом | Причина / что смотреть |
+|---|---|
+| хендшейка нет, пакеты уходят | UDP-порт закрыт у провайдера/в файрволе VPS |
+| `ping 10.66.66.2` не идёт | телефон не в туннеле или нет `-i wg0 -o wg0` в FORWARD |
+| RDP не подключается, ping есть | профиль сети `wg-pc` = Public / нет правила RDP для интерфейса |
+| ADB `offline` | на телефоне выключена беспроводная отладка |
+| Claude не работает | туннель выключен на телефоне (WG заменяет v2rayNG, а не дополняет) |
